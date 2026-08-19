@@ -7,6 +7,7 @@
 Пояс задаётся переменной окружения YANDEX_TIMEZONE, по умолчанию Europe/Moscow.
 """
 
+import copy
 import os
 import re
 import uuid
@@ -309,9 +310,153 @@ def _snapshot(uid: str, action: str, raw: str) -> str:
 
 
 def _vevent(ical):
-    for component in ical.walk("VEVENT"):
-        return component
+    """Главная запись серии — та, у которой нет метки RECURRENCE-ID.
+
+    Записи с такой меткой — заместители отдельных дней; принимать их за
+    серию нельзя, иначе правка уйдёт не туда.
+    """
+    events = list(ical.walk("VEVENT"))
+    for component in events:
+        if component.get("RECURRENCE-ID") is None:
+            return component
+    if events:
+        return events[0]
     raise CalendarError("В объекте календаря нет описания встречи.")
+
+
+def _same_value(one, other) -> bool:
+    """Сравнивает значения времени, не падая на смеси даты и даты со временем."""
+    if isinstance(one, datetime) != isinstance(other, datetime):
+        return False
+    try:
+        return one == other
+    except TypeError:  # одно со сведениями о поясе, другое без
+        return False
+
+
+def parse_occurrence(value: str, tz: ZoneInfo):
+    """Разбирает указание на один день серии: дату или дату со временем."""
+    text = (value or "").strip().replace(" ", "T")
+    if not text:
+        raise CalendarError("Не указан день серии.")
+    if "T" in text:
+        return parse_moment(text, tz)
+    return parse_day(text, date.today())
+
+
+def _instance_start(ical, wanted, tz: ZoneInfo):
+    """Находит конкретный повтор серии и его точку начала.
+
+    Возвращает (значение DTSTART этого повтора, сам повтор). Вид значения —
+    дата для событий на весь день, время с поясом для остальных — обязан
+    совпадать с видом у серии: иначе календарь не поймёт, какой день исключён.
+    """
+    if recurring_ical_events is None:
+        raise CalendarError(
+            "Не установлена библиотека recurring_ical_events — без неё нельзя "
+            "определить, какой именно повтор серии имеется в виду."
+        )
+
+    day = wanted.date() if isinstance(wanted, datetime) else wanted
+    window_start = datetime.combine(day, time.min, tzinfo=tz)
+    window_end = window_start + timedelta(days=1)
+    try:
+        found = recurring_ical_events.of(ical).between(window_start, window_end)
+    except Exception as exc:
+        raise CalendarError(f"Не удалось развернуть серию: {exc}") from exc
+
+    instances = [c for c in found if c.name == "VEVENT" and c.get("DTSTART") is not None]
+    if not instances:
+        raise CalendarError(
+            f"В этой серии нет события {day.isoformat()}. "
+            "Проверьте дату по свежей выдаче list_events."
+        )
+
+    if isinstance(wanted, datetime):
+        exact = [
+            c
+            for c in instances
+            if isinstance(c.get("DTSTART").dt, datetime)
+            and c.get("DTSTART").dt.astimezone(tz) == wanted
+        ]
+        if not exact:
+            times = ", ".join(_instance_label(c, tz) for c in instances)
+            raise CalendarError(
+                f"В день {day.isoformat()} нет повтора на {wanted:%H:%M}. "
+                f"Есть: {times}."
+            )
+        instances = exact
+
+    if len(instances) > 1:
+        times = ", ".join(_instance_label(c, tz) for c in instances)
+        raise CalendarError(
+            f"В день {day.isoformat()} у серии несколько повторов ({times}). "
+            "Укажите occurrence вместе со временем: ГГГГ-ММ-ДД ЧЧ:ММ."
+        )
+
+    return instances[0].get("DTSTART").dt, instances[0]
+
+
+def _instance_label(component, tz: ZoneInfo) -> str:
+    value = component.get("DTSTART").dt
+    if isinstance(value, datetime):
+        return f"{value.astimezone(tz):%H:%M}"
+    return "весь день"
+
+
+def _resolve_scope(component, occurrence, apply_to_series: bool, tz: ZoneInfo):
+    """Что именно затрагивается: одиночное событие, один день серии или серия.
+
+    Возвращает None для обычного события, строку "series" для всей серии
+    и разобранное указание на день — для одного повтора.
+    """
+    if component.get("RRULE") is None:
+        return None
+    if occurrence and apply_to_series:
+        raise CalendarError(
+            "Указано и occurrence, и apply_to_series. Выберите что-то одно: "
+            "либо один день серии, либо вся серия целиком."
+        )
+    if occurrence:
+        return parse_occurrence(occurrence, tz)
+    if apply_to_series:
+        return "series"
+    raise CalendarError(
+        "Это повторяющееся событие, и непонятно, что имеется в виду. "
+        "Укажите occurrence — день серии (ГГГГ-ММ-ДД, а если в этот день "
+        "несколько повторов, то с временем), либо apply_to_series=true, чтобы "
+        "затронуть всю серию целиком. Ничего не сделано."
+    )
+
+
+def _find_override(ical, start_value):
+    """Ищет запись-заместитель для конкретного дня серии."""
+    for component in ical.walk("VEVENT"):
+        raw = component.get("RECURRENCE-ID")
+        if raw is not None and _same_value(raw.dt, start_value):
+            return component
+    return None
+
+
+def _exdates(component) -> list:
+    raw = component.get("EXDATE")
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    values = []
+    for item in items:
+        for entry in getattr(item, "dts", []):
+            values.append(entry.dt)
+    return values
+
+
+def _add_exdate(component, start_value) -> None:
+    """Помечает день серии как исключённый — так удаляется один повтор."""
+    existing = _exdates(component)
+    if any(_same_value(value, start_value) for value in existing):
+        raise CalendarError("Этот день уже исключён из серии, удалять нечего.")
+    component.pop("EXDATE", None)
+    component.add("exdate", existing + [start_value])
 
 
 def _find_event(uid: str, calendar: str | None = None):
@@ -336,18 +481,6 @@ def _find_event(uid: str, calendar: str | None = None):
     raise CalendarError(
         f"Событие с меткой {uid!r} не найдено {where}. "
         "Возьмите метку из свежей выдачи list_events: она могла устареть."
-    )
-
-
-def _guard_series(component, apply_to_series: bool) -> None:
-    if component.get("RRULE") is None:
-        return
-    if apply_to_series:
-        return
-    raise CalendarError(
-        "Это повторяющееся событие, и правка затронет всю серию целиком, "
-        "а не один день. Если так и нужно, повторите с признаком "
-        "apply_to_series=true. Отдельные дни серии менять пока нельзя."
     )
 
 
@@ -380,6 +513,52 @@ def _describe(component, tz: ZoneInfo) -> dict:
     }
 
 
+REPEAT_RULES = {
+    "daily": "DAILY",
+    "weekly": "WEEKLY",
+    "monthly": "MONTHLY",
+    "yearly": "YEARLY",
+}
+
+
+def _repeat_rule(repeat, repeat_count, repeat_until, all_day: bool, tz: ZoneInfo):
+    """Собирает правило повтора. Без repeat событие остаётся одиночным."""
+    if not repeat or not str(repeat).strip():
+        if repeat_count or repeat_until:
+            raise CalendarError(
+                "Указан предел повторов, но не указан сам повтор: "
+                "нужен repeat — daily, weekly, monthly или yearly."
+            )
+        return None
+
+    freq = REPEAT_RULES.get(str(repeat).strip().lower())
+    if freq is None:
+        raise CalendarError(
+            f"Повтор {repeat!r} не понят. Бывает daily, weekly, monthly, yearly."
+        )
+    if repeat_count and repeat_until:
+        raise CalendarError(
+            "Указаны и repeat_count, и repeat_until. Выберите что-то одно: "
+            "либо число повторов, либо дату окончания."
+        )
+
+    rule = {"freq": freq}
+    if repeat_count:
+        if int(repeat_count) < 2:
+            raise CalendarError("Число повторов должно быть не меньше двух.")
+        rule["count"] = int(repeat_count)
+    elif repeat_until:
+        last_day = parse_day(repeat_until, date.today())
+        if all_day:
+            rule["until"] = last_day
+        else:
+            # по стандарту предел повторов у события со временем задаётся в UTC
+            rule["until"] = datetime.combine(
+                last_day, time(23, 59, 59), tzinfo=tz
+            ).astimezone(timezone.utc)
+    return rule
+
+
 def create_event(
     calendar: str,
     summary: str,
@@ -390,6 +569,9 @@ def create_event(
     days: int = 1,
     location: str | None = None,
     description: str | None = None,
+    repeat: str | None = None,
+    repeat_count: int | None = None,
+    repeat_until: str | None = None,
 ) -> dict:
     tz = local_tz()
     if not calendar or not calendar.strip():
@@ -452,6 +634,10 @@ def create_event(
     if description and description.strip():
         event.add("description", description.strip())
 
+    rule = _repeat_rule(repeat, repeat_count, repeat_until, all_day, tz)
+    if rule is not None:
+        event.add("rrule", rule)
+
     ical.add_component(event)
 
     try:
@@ -476,27 +662,47 @@ def update_event(
     duration_minutes: int | None = None,
     location: str | None = None,
     description: str | None = None,
+    occurrence: str | None = None,
     apply_to_series: bool = False,
 ) -> dict:
     tz = local_tz()
-    changes = {
-        "название": summary,
-        "начало": start,
-        "конец": end,
-        "длительность": duration_minutes,
-        "место": location,
-        "описание": description,
-    }
-    if all(value is None for value in changes.values()):
+    if all(
+        value is None
+        for value in (summary, start, end, duration_minutes, location, description)
+    ):
         raise CalendarError("Не указано ни одного изменения.")
 
     obj, cal_name = _find_event(uid, calendar)
     ical = obj.icalendar_instance
-    component = _vevent(ical)
-    _guard_series(component, apply_to_series)
+    master = _vevent(ical)
+    scope = _resolve_scope(master, occurrence, apply_to_series, tz)
 
-    before = _describe(component, tz)
-    backup = _snapshot(before["uid"] or uid, "изменение", obj.data)
+    if scope is None or scope == "series":
+        component = master
+        before = _describe(master, tz)
+        kind = "одиночное событие" if scope is None else "вся серия"
+    else:
+        # правка одного дня серии: заводится запись-заместитель с меткой
+        # RECURRENCE-ID — она говорит «вместо повтора такого-то числа читай это»
+        original_start, instance = _instance_start(ical, scope, tz)
+        before = _describe(instance, tz)
+        kind = "один день серии"
+        component = _find_override(ical, original_start)
+        if component is None:
+            component = copy.deepcopy(master)
+            for prop in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
+                component.pop(prop, None)
+            component.add("recurrence-id", original_start)
+            component.pop("DTSTART", None)
+            component.add("dtstart", instance.get("DTSTART").dt)
+            component.pop("DTEND", None)
+            component.pop("DURATION", None)
+            raw_end = instance.get("DTEND")
+            if raw_end is not None:
+                component.add("dtend", raw_end.dt)
+            ical.add_component(component)
+
+    backup = _snapshot(str(master.get("UID", "") or uid), "изменение", obj.data)
 
     if summary is not None:
         if not summary.strip():
@@ -556,6 +762,7 @@ def update_event(
     return {
         "timezone": str(tz),
         "calendar": cal_name,
+        "scope": kind,
         "before": before,
         "after": _describe(component, tz),
         "backup": backup,
@@ -566,13 +773,18 @@ def delete_event(
     uid: str,
     summary: str,
     calendar: str | None = None,
+    occurrence: str | None = None,
     apply_to_series: bool = False,
 ) -> dict:
-    """Удаление с тремя предохранителями: сверка названия, копия, отчёт.
+    """Удаление с предохранителями: сверка названия, копия, отчёт о сделанном.
 
     Название запрашивается не для красоты: метка события может устареть или
     быть перепутана, и тогда сверка — единственное, что отличает нужное
     событие от чужого.
+
+    Один день серии удаляется не стиранием события, а пометкой «исключённая
+    дата» (EXDATE) в самой серии: серия остаётся целой, пропадает только
+    названный день.
     """
     tz = local_tz()
     if not summary or not summary.strip():
@@ -583,10 +795,18 @@ def delete_event(
 
     obj, cal_name = _find_event(uid, calendar)
     ical = obj.icalendar_instance
-    component = _vevent(ical)
-    _guard_series(component, apply_to_series)
+    master = _vevent(ical)
+    scope = _resolve_scope(master, occurrence, apply_to_series, tz)
 
-    found = _describe(component, tz)
+    original_start = None
+    if scope is None or scope == "series":
+        found = _describe(master, tz)
+        kind = "одиночное событие" if scope is None else "вся серия"
+    else:
+        original_start, instance = _instance_start(ical, scope, tz)
+        found = _describe(instance, tz)
+        kind = "один день серии"
+
     if found["summary"].strip().casefold() != summary.strip().casefold():
         raise CalendarError(
             f"Название не совпало. Просили удалить «{summary.strip()}», "
@@ -594,10 +814,21 @@ def delete_event(
             "Ничего не удалено."
         )
 
-    backup = _snapshot(found["uid"] or uid, "удаление", obj.data)
+    backup = _snapshot(str(master.get("UID", "") or uid), "удаление", obj.data)
 
     try:
-        obj.delete()
+        if original_start is None:
+            obj.delete()
+        else:
+            override = _find_override(ical, original_start)
+            if override is not None:
+                ical.subcomponents.remove(override)
+            _add_exdate(master, original_start)
+            _touch(master)
+            obj.data = ical.to_ical().decode("utf-8")
+            obj.save()
+    except CalendarError:
+        raise
     except Exception as exc:
         raise CalendarError(
             f"Яндекс не дал удалить событие: {exc}. Копия события: {backup}"
@@ -606,6 +837,7 @@ def delete_event(
     return {
         "timezone": str(tz),
         "calendar": cal_name,
+        "scope": kind,
         "event": found,
         "backup": backup,
     }

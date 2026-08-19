@@ -21,13 +21,23 @@ python src/server.py < tests/probe.jsonl
 python tests/write_cycle.py "Calendar name"
 ```
 
-Creates a test event tomorrow, then:
+Two rounds. First a one-off event tomorrow:
 
 1. tries to delete it with a **wrong title** — this must be **refused**;
 2. moves it and renames it;
 3. checks that it appears in the day's listing;
 4. deletes it with the correct title;
 5. checks that it is gone.
+
+Then a weekly series of three occurrences:
+
+6. checks it expands into exactly three days;
+7. edits the **middle occurrence** and checks that exactly one day changed;
+8. deletes the **last occurrence** and checks that exactly one day vanished;
+9. deletes the whole series and checks nothing is left.
+
+Шаги 7 и 8 — главные: они доказывают, что правка и удаление одного дня серии
+не задевают остальные дни.
 
 The cycle cleans up after itself. If the final delete fails, the leftover
 event's `uid` is printed — leaving rubbish in someone's real calendar without

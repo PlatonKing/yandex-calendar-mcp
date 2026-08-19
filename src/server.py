@@ -94,8 +94,9 @@ TOOLS = [
     {
         "name": "create_event",
         "description": (
-            "Создать событие в Яндекс Календаре. Время указывается в настроенном "
-            "поясе, метка часового пояса проставляется сама. "
+            "Создать событие в Яндекс Календаре: разовое, на весь день или "
+            "повторяющееся. Время указывается в настроенном поясе, метка "
+            "часового пояса проставляется сама. "
             "Календарь обязателен: их несколько и они под разные задачи — "
             "если пользователь не назвал календарь, спросите, а не выбирайте сами."
         ),
@@ -135,6 +136,25 @@ TOOLS = [
                 },
                 "location": {"type": "string", "description": "Место."},
                 "description": {"type": "string", "description": "Описание, заметка."},
+                "repeat": {
+                    "type": "string",
+                    "enum": ["daily", "weekly", "monthly", "yearly"],
+                    "description": (
+                        "Сделать событие повторяющимся: каждый день, каждую "
+                        "неделю, месяц или год. Без этого поля событие одиночное."
+                    ),
+                },
+                "repeat_count": {
+                    "type": "integer",
+                    "description": "Сколько всего раз повторить. Нельзя вместе с repeat_until.",
+                },
+                "repeat_until": {
+                    "type": "string",
+                    "description": (
+                        "До какой даты повторять, ГГГГ-ММ-ДД включительно. "
+                        "Нельзя вместе с repeat_count."
+                    ),
+                },
             },
             "required": ["calendar", "summary", "start"],
         },
@@ -145,7 +165,9 @@ TOOLS = [
             "Изменить существующее событие: перенести время, переименовать, "
             "сменить место или описание. Событие ищется по метке id из list_events. "
             "Передавайте только то, что меняется; остальное останется как было. "
-            "Копия события до правки сохраняется на сервере."
+            "У повторяющегося события можно изменить либо один день — параметр "
+            "occurrence, — либо всю серию целиком (apply_to_series). "
+            "Копия события до правки сохраняется в корзине."
         ),
         "inputSchema": {
             "type": "object",
@@ -176,12 +198,21 @@ TOOLS = [
                 },
                 "location": {"type": "string", "description": "Новое место."},
                 "description": {"type": "string", "description": "Новое описание."},
+                "occurrence": {
+                    "type": "string",
+                    "description": (
+                        "Только для повторяющихся событий: день серии, который "
+                        "меняется, ГГГГ-ММ-ДД. Если в этот день несколько "
+                        "повторов, добавьте время: ГГГГ-ММ-ДД ЧЧ:ММ. Остальные "
+                        "дни серии не затрагиваются."
+                    ),
+                },
                 "apply_to_series": {
                     "type": "boolean",
                     "description": (
-                        "Только для повторяющихся событий. Правка задевает всю серию "
-                        "целиком, а не выбранный день. Без этого признака инструмент "
-                        "откажет. Ставьте, только если пользователь согласился менять всю серию."
+                        "Только для повторяющихся событий: изменить всю серию "
+                        "целиком. Взаимоисключающе с occurrence. Для серии "
+                        "нужно указать одно из двух, иначе инструмент откажет."
                     ),
                 },
             },
@@ -194,8 +225,10 @@ TOOLS = [
             "Удалить событие из Яндекс Календаря. Действие необратимо на стороне "
             "Яндекса, поэтому спрашивайте у пользователя явное согласие до вызова. "
             "Нужны и метка id, и название ровно как в выдаче list_events: названия "
-            "сверяются, и при расхождении не удаляется ничего. Копия удалённого "
-            "события сохраняется на сервере."
+            "сверяются, и при расхождении не удаляется ничего. У повторяющегося "
+            "события можно удалить либо один день — параметр occurrence, — либо всю "
+            "серию целиком (apply_to_series). Копия удалённого события сохраняется "
+            "в корзине."
         ),
         "inputSchema": {
             "type": "object",
@@ -212,11 +245,21 @@ TOOLS = [
                     "type": "string",
                     "description": "Имя календаря, если известно: ускоряет поиск.",
                 },
+                "occurrence": {
+                    "type": "string",
+                    "description": (
+                        "Только для повторяющихся событий: день серии, который "
+                        "удаляется, ГГГГ-ММ-ДД. Если в этот день несколько "
+                        "повторов, добавьте время: ГГГГ-ММ-ДД ЧЧ:ММ. Сама серия "
+                        "сохраняется, пропадает только этот день."
+                    ),
+                },
                 "apply_to_series": {
                     "type": "boolean",
                     "description": (
-                        "Только для повторяющихся событий. Удаляется вся серия целиком, "
-                        "а не выбранный день. Без этого признака инструмент откажет."
+                        "Только для повторяющихся событий: удалить всю серию "
+                        "целиком. Взаимоисключающе с occurrence. Для серии нужно "
+                        "указать одно из двух, иначе инструмент откажет."
                     ),
                 },
             },
@@ -296,7 +339,7 @@ def format_one(ev: dict) -> str:
     if ev["location"]:
         parts.append(f"место: {ev['location']}")
     if ev["repeating"]:
-        parts.append("повторяющееся, вся серия")
+        parts.append("повторяющееся")
     if ev["uid"]:
         parts.append(f"id: {ev['uid']}")
     return " | ".join(parts)
@@ -314,7 +357,8 @@ def format_created(data: dict) -> str:
 def format_updated(data: dict) -> str:
     return "\n".join(
         [
-            f"Событие изменено в календаре «{data['calendar']}», время в настроенном поясе.",
+            f"Изменено в календаре «{data['calendar']}» ({data['scope']}), "
+            "время в настроенном поясе.",
             "  было: " + format_one(data["before"]),
             "  стало: " + format_one(data["after"]),
             f"  копия до правки: {data['backup']}",
@@ -325,7 +369,7 @@ def format_updated(data: dict) -> str:
 def format_deleted(data: dict) -> str:
     return "\n".join(
         [
-            f"Событие удалено из календаря «{data['calendar']}»:",
+            f"Удалено из календаря «{data['calendar']}» ({data['scope']}):",
             "  " + format_one(data["event"]),
             f"  копия сохранена: {data['backup']}",
         ]
@@ -369,6 +413,9 @@ def call_tool(name: str, arguments: dict) -> dict:
                     days=int(arguments.get("days") or 1),
                     location=arguments.get("location"),
                     description=arguments.get("description"),
+                    repeat=arguments.get("repeat"),
+                    repeat_count=arguments.get("repeat_count"),
+                    repeat_until=arguments.get("repeat_until"),
                 )
             )
         elif name == "update_event":
@@ -382,6 +429,7 @@ def call_tool(name: str, arguments: dict) -> dict:
                     duration_minutes=arguments.get("duration_minutes"),
                     location=arguments.get("location"),
                     description=arguments.get("description"),
+                    occurrence=arguments.get("occurrence"),
                     apply_to_series=bool(arguments.get("apply_to_series")),
                 )
             )
@@ -391,6 +439,7 @@ def call_tool(name: str, arguments: dict) -> dict:
                     uid=arguments.get("uid") or "",
                     summary=arguments.get("summary") or "",
                     calendar=arguments.get("calendar"),
+                    occurrence=arguments.get("occurrence"),
                     apply_to_series=bool(arguments.get("apply_to_series")),
                 )
             )

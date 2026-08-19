@@ -10,28 +10,51 @@ CalDAV. Read the schedule, create, move and delete events.
 > configuration and this document are in English. Everything else works
 > regardless of language.
 
-## Why another one
+## What it does
 
-Existing implementations get time zones wrong in a way that is quiet and
-therefore dangerous — the numbers look plausible and are three hours off. This
-server treats time zones as the primary concern:
+**Reading**
+
+- Events for any period: today by default, or an explicit range up to 92 days.
+- All calendars at once, with every event labelled by the calendar it came
+  from — or a single calendar selected by name.
+- Recurring events expanded into concrete dates. If expansion fails, the event
+  is returned with a warning rather than presented as accurate.
+- All-day events recognised as such, not shown as midnight appointments.
+- Every answer states the time zone and UTC offset it used.
+
+**Writing**
+
+- Create an event: title, start, end or duration, location, description;
+  timed or all-day spanning several days.
+- Create a recurring event — daily, weekly, monthly or yearly — bounded by a
+  number of occurrences or by an end date.
+- Update an event: move it, rename it, change location or description. Only
+  the fields you pass are touched; a moved event keeps its original duration
+  unless you say otherwise.
+- Edit or delete **a single occurrence** of a recurring series, or the whole
+  series. A changed day becomes a `RECURRENCE-ID` override, a removed day an
+  `EXDATE` — the standard mechanisms, so the result looks right in the Yandex
+  app and in any other client.
+- Delete an event, with the safeguards described below.
+
+**Time zones, handled deliberately**
 
 - Every timestamp is converted to the configured zone with `zoneinfo`. Time
   strings are never sliced by character position.
 - Written events carry an explicit `DTSTART;TZID=…` plus a full `VTIMEZONE`
   block, so any calendar client reads them the same way.
-- The answer always states the zone and the UTC offset it used, so a mistake
+- The machine running the server is usually on UTC; that never leaks into the
+  answers, and the zone actually used is named in every response, so a mistake
   is visible instead of silent.
 
-Beyond that:
+**Built for an assistant to drive**
 
-- **Recurring events are expanded** into concrete dates. If expansion fails,
-  the event is returned with a warning rather than presented as accurate.
-- **Calendars are selected by name.** With no name given, reading spans all
-  calendars and every event is labelled with the one it came from — no
-  "first calendar in the list" guesswork.
-- **Editing exists**, which matters more day to day than creating.
-- **Deleting is guarded** — see below.
+- Responses are plain readable text with the event `uid` included, so an edit
+  or delete can follow a listing directly.
+- `create_event` requires an explicit calendar: people keep several calendars
+  for different purposes, and an event silently filed into the wrong one is an
+  event that is lost. The assistant is expected to ask rather than guess.
+- Errors come back as sentences explaining what to do next, not stack traces.
 
 ## Requirements
 
@@ -68,13 +91,9 @@ The server speaks MCP over stdio. Example client configuration is in
 |---|---|
 | `list_events` | events for a period; defaults to today; expands recurrences |
 | `list_calendars` | calendar names and URLs |
-| `create_event` | create an event; `calendar` is required |
-| `update_event` | move, rename, change location or description |
-| `delete_event` | delete an event |
-
-`create_event` deliberately requires an explicit calendar. People keep several
-calendars for different purposes, and an event silently filed into the wrong
-one is an event that is lost.
+| `create_event` | create an event, one-off or recurring; `calendar` is required |
+| `update_event` | move, rename, change location or description; one day of a series or the whole series |
+| `delete_event` | delete an event; one day of a series or the whole series |
 
 ## Deleting is irreversible — what protects you
 
@@ -86,9 +105,10 @@ one is an event that is lost.
    is written to `YANDEX_TRASH_DIR` as a timestamped `.ics` file. If the copy
    cannot be written, the operation does not run at all. Recovery is importing
    that file back.
-3. **Recurring series.** Editing or deleting a recurring event affects the
-   **entire series**. Without an explicit `apply_to_series` flag the tool
-   refuses and explains why. Changing a single occurrence is not supported.
+3. **Recurring series.** Any edit or delete on a series has to say what it
+   applies to: `occurrence` for one day, `apply_to_series` for the whole
+   series. With neither, the tool refuses and explains the choice. This is
+   what keeps "cancel Tuesday" from erasing a year of meetings.
 
 ## Testing
 
@@ -111,9 +131,11 @@ python src/server.py < tests/probe.jsonl
 
 ## Known limitations
 
-- A single occurrence of a recurring series cannot be edited or deleted —
-  only the whole series.
 - All-day events can be created, but their time cannot be moved.
+- Recurrence rules are created in their common forms (every day / week /
+  month / year, with a count or an end date). More elaborate rules — "every
+  second Tuesday", weekday sets — are read and expanded correctly but cannot
+  be created through the tool.
 - Attendees, reminders and invitations are not handled.
 - Verified against Yandex Calendar only. Other CalDAV servers are likely to
   work but are untested.
