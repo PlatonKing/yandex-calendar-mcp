@@ -1,0 +1,611 @@
+"""Чтение и изменение Яндекс Календаря по протоколу CalDAV.
+
+Главная забота модуля — часовые пояса. Часы машины, где крутится сервер,
+обычно идут по UTC, а пользователь живёт в своём поясе. Поэтому любое время,
+которое уходит наружу, приводится к нужному поясу явно, а не «как получится».
+
+Пояс задаётся переменной окружения YANDEX_TIMEZONE, по умолчанию Europe/Moscow.
+"""
+
+import os
+import re
+import uuid
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import caldav
+from icalendar import Calendar, Event, Timezone
+
+try:  # разворачивание повторяющихся событий; без него работаем честно, но хуже
+    import recurring_ical_events
+except ImportError:  # pragma: no cover
+    recurring_ical_events = None
+
+
+DEFAULT_URL = "https://caldav.yandex.ru"
+DEFAULT_TZ = "Europe/Moscow"
+# Корзина по умолчанию — папка trash рядом с проектом. Переопределяется
+# переменной YANDEX_TRASH_DIR; на сервере её стоит задать явно.
+DEFAULT_TRASH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trash"
+)
+MAX_RANGE_DAYS = 92
+DEFAULT_DURATION_MINUTES = 60
+
+
+class CalendarError(Exception):
+    """Ошибка, текст которой можно показывать пользователю как есть."""
+
+
+def local_tz() -> ZoneInfo:
+    name = os.environ.get("YANDEX_TIMEZONE") or DEFAULT_TZ
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:
+        raise CalendarError(
+            f"Не найден часовой пояс {name!r}. "
+            "Либо имя неверное, либо в системе нет справочника поясов — "
+            "поставьте пакет tzdata."
+        ) from exc
+
+
+def _credentials() -> tuple[str, str, str]:
+    url = os.environ.get("YANDEX_CALDAV_URL") or DEFAULT_URL
+    user = os.environ.get("YANDEX_USERNAME") or ""
+    password = os.environ.get("YANDEX_PASSWORD") or ""
+    missing = [
+        name
+        for name, value in (("YANDEX_USERNAME", user), ("YANDEX_PASSWORD", password))
+        if not value
+    ]
+    if missing:
+        raise CalendarError(
+            "Не заданы переменные окружения: "
+            + ", ".join(missing)
+            + ". Нужны логин вида имя@yandex.ru и пароль приложения, созданный "
+            "на https://id.yandex.ru/security/app-passwords для типа «Календарь "
+            "(CalDAV)». Обычный пароль аккаунта для CalDAV не подходит."
+        )
+    return url, user, password
+
+
+def _connect() -> "caldav.Principal":
+    url, user, password = _credentials()
+    try:
+        client = caldav.DAVClient(url=url, username=user, password=password)
+        return client.principal()
+    except Exception as exc:
+        raise CalendarError(
+            f"Не удалось подключиться к {url}: {exc}. "
+            "Частая причина — обычный пароль аккаунта вместо пароля приложения."
+        ) from exc
+
+
+def list_calendars() -> list[dict]:
+    calendars = []
+    for cal in _connect().calendars():
+        try:
+            name = cal.name or ""
+        except Exception:
+            name = ""
+        calendars.append({"name": name, "url": str(cal.url)})
+    return calendars
+
+
+def _pick(calendars: list, wanted: str | None) -> list:
+    """Выбор календарей по имени. Без имени — все, чтобы ничего не потерять.
+
+    Чужой проект брал calendars[0] вслепую; здесь либо явное совпадение,
+    либо честный перебор всех.
+    """
+    if not wanted:
+        return calendars
+    needle = wanted.strip().casefold()
+    exact = [c for c in calendars if (c.name or "").casefold() == needle]
+    if exact:
+        return exact
+    partial = [c for c in calendars if needle in (c.name or "").casefold()]
+    if partial:
+        return partial
+    known = ", ".join(repr(c.name) for c in calendars) or "ни одного"
+    raise CalendarError(f"Календарь {wanted!r} не найден. Доступны: {known}.")
+
+
+def parse_day(value: str | None, fallback: date) -> date:
+    if value is None or value == "":
+        return fallback
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise CalendarError(
+            f"Дату {value!r} не разобрать. Нужен вид ГГГГ-ММ-ДД, например 2026-08-19."
+        ) from exc
+
+
+def _as_local(value, tz: ZoneInfo):
+    """Приводит время события к местному поясу.
+
+    Возвращает (значение, признак «событие на весь день»).
+    Дата без времени остаётся датой — это событие на весь день.
+    Время без пояса по стандарту iCalendar считается местным.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=tz), False
+        return value.astimezone(tz), False
+    if isinstance(value, date):
+        return value, True
+    return None, False
+
+
+def _event_bounds(component, tz: ZoneInfo):
+    raw_start = component.get("DTSTART")
+    if raw_start is None:
+        return None, None, False
+    start, all_day = _as_local(raw_start.dt, tz)
+
+    raw_end = component.get("DTEND")
+    if raw_end is not None:
+        end, _ = _as_local(raw_end.dt, tz)
+    else:
+        duration = component.get("DURATION")
+        if duration is not None and start is not None:
+            end = start + duration.dt
+        elif all_day:
+            end = start + timedelta(days=1)
+        else:
+            end = start
+    return start, end, all_day
+
+
+def _expand(ical, start: datetime, end: datetime):
+    """Разворачивает повторяющиеся события в конкретные даты.
+
+    Второе значение — удалось ли развернуть. Если нет, событие всё равно
+    вернётся, но будет помечено: лучше честная пометка, чем тихая потеря.
+    """
+    if recurring_ical_events is not None:
+        try:
+            return list(recurring_ical_events.of(ical).between(start, end)), True
+        except Exception:
+            pass
+    return list(ical.walk("VEVENT")), False
+
+
+def list_events(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    calendar: str | None = None,
+) -> dict:
+    tz = local_tz()
+    today = datetime.now(tz).date()
+    day_from = parse_day(date_from, today)
+    day_to = parse_day(date_to, day_from)
+
+    if day_to < day_from:
+        raise CalendarError(f"Конец периода ({day_to}) раньше начала ({day_from}).")
+    if (day_to - day_from).days + 1 > MAX_RANGE_DAYS:
+        raise CalendarError(
+            f"Период больше {MAX_RANGE_DAYS} дней. Запросите отрезок покороче."
+        )
+
+    start = datetime.combine(day_from, time.min, tzinfo=tz)
+    end = datetime.combine(day_to + timedelta(days=1), time.min, tzinfo=tz)
+
+    principal = _connect()
+    try:
+        available = principal.calendars()
+    except Exception as exc:
+        raise CalendarError(f"Не удалось получить список календарей: {exc}") from exc
+
+    events: list[dict] = []
+    warnings: list[str] = []
+
+    for cal in _pick(available, calendar):
+        cal_name = cal.name or "без имени"
+        try:
+            found = cal.search(start=start, end=end, event=True, expand=False)
+        except Exception as exc:
+            warnings.append(f"Календарь «{cal_name}» не ответил: {exc}")
+            continue
+
+        for item in found:
+            try:
+                ical = item.icalendar_instance
+            except Exception as exc:
+                warnings.append(f"Событие в «{cal_name}» не разобрано: {exc}")
+                continue
+
+            components, expanded = _expand(ical, start, end)
+            for component in components:
+                if component.name != "VEVENT":
+                    continue
+                if str(component.get("STATUS", "")).upper() == "CANCELLED":
+                    continue
+
+                ev_start, ev_end, all_day = _event_bounds(component, tz)
+                if ev_start is None:
+                    continue
+
+                repeating = component.get("RRULE") is not None
+                events.append(
+                    {
+                        "calendar": cal_name,
+                        "summary": str(component.get("SUMMARY", "") or "(без названия)"),
+                        "location": str(component.get("LOCATION", "") or ""),
+                        "start": ev_start,
+                        "end": ev_end,
+                        "all_day": all_day,
+                        "uid": str(component.get("UID", "") or ""),
+                        "repeating": repeating,
+                        "expanded": expanded or not repeating,
+                    }
+                )
+
+    def sort_key(ev):
+        value = ev["start"]
+        if isinstance(value, datetime):
+            return (value.date(), 1, value.time())
+        return (value, 0, time.min)
+
+    events.sort(key=sort_key)
+
+    return {
+        "timezone": str(tz),
+        "now": datetime.now(tz),
+        "date_from": day_from,
+        "date_to": day_to,
+        "events": events,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Запись: создание, изменение, удаление
+# ---------------------------------------------------------------------------
+
+
+def parse_moment(value: str, tz: ZoneInfo) -> datetime:
+    """Разбирает «2026-09-01 15:00» или «2026-09-01T15:00» как московское время."""
+    if not value or not value.strip():
+        raise CalendarError("Не указано время начала.")
+    text = value.strip().replace(" ", "T")
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise CalendarError(
+            f"Время {value!r} не разобрать. Нужен вид ГГГГ-ММ-ДД ЧЧ:ММ, "
+            "например 2026-09-01 15:00."
+        ) from exc
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=tz)
+    return moment.astimezone(tz)
+
+
+def _trash_dir() -> str:
+    return os.environ.get("YANDEX_TRASH_DIR") or DEFAULT_TRASH
+
+
+def _snapshot(uid: str, action: str, raw: str) -> str:
+    """Сохраняет копию события до изменения или удаления.
+
+    Без успешной копии дальше не идём: удаление в чужом сервисе необратимо,
+    и единственное, что делает промах исправимым, — это сохранённый оригинал.
+    """
+    folder = _trash_dir()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", uid)[:80] or "без-метки"
+    path = os.path.join(folder, f"{stamp}-{action}-{safe}.ics")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(raw)
+    except OSError as exc:
+        raise CalendarError(
+            f"Не удалось сохранить копию события в {folder}: {exc}. "
+            "Без копии изменение и удаление не выполняются."
+        ) from exc
+    return path
+
+
+def _vevent(ical):
+    for component in ical.walk("VEVENT"):
+        return component
+    raise CalendarError("В объекте календаря нет описания встречи.")
+
+
+def _find_event(uid: str, calendar: str | None = None):
+    if not uid or not uid.strip():
+        raise CalendarError("Не указана метка события (id).")
+    uid = uid.strip()
+    principal = _connect()
+    try:
+        available = principal.calendars()
+    except Exception as exc:
+        raise CalendarError(f"Не удалось получить список календарей: {exc}") from exc
+
+    for cal in _pick(available, calendar):
+        try:
+            found = cal.event_by_uid(uid)
+        except Exception:
+            continue
+        if found is not None:
+            return found, (cal.name or "без имени")
+
+    where = f"в календаре {calendar!r}" if calendar else "ни в одном календаре"
+    raise CalendarError(
+        f"Событие с меткой {uid!r} не найдено {where}. "
+        "Возьмите метку из свежей выдачи list_events: она могла устареть."
+    )
+
+
+def _guard_series(component, apply_to_series: bool) -> None:
+    if component.get("RRULE") is None:
+        return
+    if apply_to_series:
+        return
+    raise CalendarError(
+        "Это повторяющееся событие, и правка затронет всю серию целиком, "
+        "а не один день. Если так и нужно, повторите с признаком "
+        "apply_to_series=true. Отдельные дни серии менять пока нельзя."
+    )
+
+
+def _touch(component) -> None:
+    """Отмечает правку: часы изменения и порядковый номер версии."""
+    now = datetime.now(timezone.utc)
+    component.pop("DTSTAMP", None)
+    component.add("dtstamp", now)
+    component.pop("LAST-MODIFIED", None)
+    component.add("last-modified", now)
+    try:
+        sequence = int(component.get("SEQUENCE", 0))
+    except (TypeError, ValueError):
+        sequence = 0
+    component.pop("SEQUENCE", None)
+    component.add("sequence", sequence + 1)
+
+
+def _describe(component, tz: ZoneInfo) -> dict:
+    start, end, all_day = _event_bounds(component, tz)
+    return {
+        "summary": str(component.get("SUMMARY", "") or "(без названия)"),
+        "location": str(component.get("LOCATION", "") or ""),
+        "start": start,
+        "end": end,
+        "all_day": all_day,
+        "uid": str(component.get("UID", "") or ""),
+        "repeating": component.get("RRULE") is not None,
+        "expanded": True,
+    }
+
+
+def create_event(
+    calendar: str,
+    summary: str,
+    start: str,
+    end: str | None = None,
+    duration_minutes: int | None = None,
+    all_day: bool = False,
+    days: int = 1,
+    location: str | None = None,
+    description: str | None = None,
+) -> dict:
+    tz = local_tz()
+    if not calendar or not calendar.strip():
+        raise CalendarError(
+            "Не указан календарь. Календарей несколько и они под разные задачи — "
+            "спросите, в какой класть. Список даёт list_calendars."
+        )
+    if not summary or not summary.strip():
+        raise CalendarError("Не указано название события.")
+
+    principal = _connect()
+    targets = _pick(principal.calendars(), calendar)
+    if len(targets) > 1:
+        names = ", ".join(repr(c.name) for c in targets)
+        raise CalendarError(
+            f"Под описание {calendar!r} подходит несколько календарей: {names}. "
+            "Назовите один точно."
+        )
+    target = targets[0]
+
+    ical = Calendar()
+    ical.add("prodid", "-//yandex-calendar-mcp//RU")
+    ical.add("version", "2.0")
+
+    event = Event()
+    uid = f"{uuid.uuid4()}@yandex-calendar-mcp"
+    event.add("uid", uid)
+    event.add("dtstamp", datetime.now(timezone.utc))
+    event.add("summary", summary.strip())
+
+    if all_day:
+        day_start = parse_day(start.split("T")[0].split(" ")[0], date.today())
+        if days < 1:
+            raise CalendarError("Число дней должно быть не меньше одного.")
+        event.add("dtstart", day_start)
+        event.add("dtend", day_start + timedelta(days=days))
+    else:
+        moment = parse_moment(start, tz)
+        if end:
+            finish = parse_moment(end, tz)
+        else:
+            minutes = duration_minutes or DEFAULT_DURATION_MINUTES
+            if minutes < 1:
+                raise CalendarError("Длительность должна быть больше нуля.")
+            finish = moment + timedelta(minutes=minutes)
+        if finish <= moment:
+            raise CalendarError(
+                f"Конец события ({finish:%Y-%m-%d %H:%M}) не позже начала "
+                f"({moment:%Y-%m-%d %H:%M})."
+            )
+        event.add("dtstart", moment)
+        event.add("dtend", finish)
+        try:  # описание пояса внутри события — чтобы его правильно понял любой календарь
+            ical.add_component(Timezone.from_tzid(str(tz)))
+        except Exception:
+            pass
+
+    if location and location.strip():
+        event.add("location", location.strip())
+    if description and description.strip():
+        event.add("description", description.strip())
+
+    ical.add_component(event)
+
+    try:
+        target.save_event(ical.to_ical().decode("utf-8"))
+    except Exception as exc:
+        raise CalendarError(f"Яндекс не принял событие: {exc}") from exc
+
+    return {
+        "timezone": str(tz),
+        "calendar": target.name or "без имени",
+        "event": _describe(event, tz),
+        "uid": uid,
+    }
+
+
+def update_event(
+    uid: str,
+    calendar: str | None = None,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    duration_minutes: int | None = None,
+    location: str | None = None,
+    description: str | None = None,
+    apply_to_series: bool = False,
+) -> dict:
+    tz = local_tz()
+    changes = {
+        "название": summary,
+        "начало": start,
+        "конец": end,
+        "длительность": duration_minutes,
+        "место": location,
+        "описание": description,
+    }
+    if all(value is None for value in changes.values()):
+        raise CalendarError("Не указано ни одного изменения.")
+
+    obj, cal_name = _find_event(uid, calendar)
+    ical = obj.icalendar_instance
+    component = _vevent(ical)
+    _guard_series(component, apply_to_series)
+
+    before = _describe(component, tz)
+    backup = _snapshot(before["uid"] or uid, "изменение", obj.data)
+
+    if summary is not None:
+        if not summary.strip():
+            raise CalendarError("Название не может быть пустым.")
+        component.pop("SUMMARY", None)
+        component.add("summary", summary.strip())
+
+    if location is not None:
+        component.pop("LOCATION", None)
+        if location.strip():
+            component.add("location", location.strip())
+
+    if description is not None:
+        component.pop("DESCRIPTION", None)
+        if description.strip():
+            component.add("description", description.strip())
+
+    if start is not None or end is not None or duration_minutes is not None:
+        if before["all_day"]:
+            raise CalendarError(
+                "Это событие на весь день; перенос времени для таких пока не сделан."
+            )
+        moment = parse_moment(start, tz) if start is not None else before["start"]
+        if end is not None:
+            finish = parse_moment(end, tz)
+        elif duration_minutes is not None:
+            if duration_minutes < 1:
+                raise CalendarError("Длительность должна быть больше нуля.")
+            finish = moment + timedelta(minutes=duration_minutes)
+        elif isinstance(before["end"], datetime) and isinstance(before["start"], datetime):
+            finish = moment + (before["end"] - before["start"])
+        else:
+            finish = moment + timedelta(minutes=DEFAULT_DURATION_MINUTES)
+
+        if finish <= moment:
+            raise CalendarError(
+                f"Конец события ({finish:%Y-%m-%d %H:%M}) не позже начала "
+                f"({moment:%Y-%m-%d %H:%M})."
+            )
+
+        component.pop("DTSTART", None)
+        component.add("dtstart", moment)
+        component.pop("DTEND", None)
+        component.pop("DURATION", None)
+        component.add("dtend", finish)
+
+    _touch(component)
+
+    try:
+        obj.data = ical.to_ical().decode("utf-8")
+        obj.save()
+    except Exception as exc:
+        raise CalendarError(
+            f"Яндекс не принял изменение: {exc}. Копия события до правки: {backup}"
+        ) from exc
+
+    return {
+        "timezone": str(tz),
+        "calendar": cal_name,
+        "before": before,
+        "after": _describe(component, tz),
+        "backup": backup,
+    }
+
+
+def delete_event(
+    uid: str,
+    summary: str,
+    calendar: str | None = None,
+    apply_to_series: bool = False,
+) -> dict:
+    """Удаление с тремя предохранителями: сверка названия, копия, отчёт.
+
+    Название запрашивается не для красоты: метка события может устареть или
+    быть перепутана, и тогда сверка — единственное, что отличает нужное
+    событие от чужого.
+    """
+    tz = local_tz()
+    if not summary or not summary.strip():
+        raise CalendarError(
+            "Не указано название удаляемого события. Оно нужно для сверки: "
+            "возьмите его из выдачи list_events ровно как там написано."
+        )
+
+    obj, cal_name = _find_event(uid, calendar)
+    ical = obj.icalendar_instance
+    component = _vevent(ical)
+    _guard_series(component, apply_to_series)
+
+    found = _describe(component, tz)
+    if found["summary"].strip().casefold() != summary.strip().casefold():
+        raise CalendarError(
+            f"Название не совпало. Просили удалить «{summary.strip()}», "
+            f"а по этой метке лежит «{found['summary']}» в календаре «{cal_name}». "
+            "Ничего не удалено."
+        )
+
+    backup = _snapshot(found["uid"] or uid, "удаление", obj.data)
+
+    try:
+        obj.delete()
+    except Exception as exc:
+        raise CalendarError(
+            f"Яндекс не дал удалить событие: {exc}. Копия события: {backup}"
+        ) from exc
+
+    return {
+        "timezone": str(tz),
+        "calendar": cal_name,
+        "event": found,
+        "backup": backup,
+    }

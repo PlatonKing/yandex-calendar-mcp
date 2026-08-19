@@ -1,0 +1,25 @@
+# --- секреты: не должны попасть в репозиторий ни при каких условиях ---
+.env
+.env.*
+*.key
+*.pem
+secrets/
+.secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+lib/
+*.egg-info/
+
+# --- служебное ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.bak
+*.bak-*
+
+# корзина: копии изменённых и удалённых событий
+trash/
