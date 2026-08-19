@@ -119,7 +119,11 @@ The server speaks MCP over stdio. Example client configuration is in
 
 Yandex advertises `calendar-auto-schedule`, so adding an attendee makes the
 server send an invitation, and removing one sends a cancellation. Neither can
-be recalled. What follows from that:
+be recalled. This was verified end to end, not merely from the server's
+advertised capabilities: an invitation added through `create_event` arrived in
+the recipient's mailbox.
+
+What follows from that:
 
 - Addresses are taken literally and validated. The server never derives an
   address from a name — an assistant that half-remembers a contact would
