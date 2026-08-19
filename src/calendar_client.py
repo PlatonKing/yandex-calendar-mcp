@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import caldav
-from icalendar import Calendar, Event, Timezone
+from icalendar import Calendar, Event, Timezone, vCalAddress, vText
 
 try:  # разворачивание повторяющихся событий; без него работаем честно, но хуже
     import recurring_ical_events
@@ -32,6 +32,17 @@ DEFAULT_TRASH = os.path.join(
 )
 MAX_RANGE_DAYS = 92
 DEFAULT_DURATION_MINUTES = 60
+
+EMAIL_SHAPE = re.compile(r"^[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+$")
+
+# как называются ответы участников на приглашение
+PARTSTAT_LABELS = {
+    "NEEDS-ACTION": "не ответил",
+    "ACCEPTED": "принял",
+    "DECLINED": "отказался",
+    "TENTATIVE": "под вопросом",
+    "DELEGATED": "передал другому",
+}
 
 
 class CalendarError(Exception):
@@ -240,6 +251,7 @@ def list_events(
                         "uid": str(component.get("UID", "") or ""),
                         "repeating": repeating,
                         "expanded": expanded or not repeating,
+                        "attendees": _people(component),
                     }
                 )
 
@@ -510,7 +522,119 @@ def _describe(component, tz: ZoneInfo) -> dict:
         "uid": str(component.get("UID", "") or ""),
         "repeating": component.get("RRULE") is not None,
         "expanded": True,
+        "attendees": _people(component),
     }
+
+
+def _parse_person(spec: str) -> tuple[str, str]:
+    """Разбирает «Имя Фамилия <адрес@почта>» или просто «адрес@почта»."""
+    text = (spec or "").strip()
+    if not text:
+        raise CalendarError("Пустая запись участника.")
+    name = ""
+    email = text
+    if "<" in text and text.endswith(">"):
+        name, email = text.split("<", 1)
+        name = name.strip().strip('"')
+        email = email[:-1].strip()
+    if email.lower().startswith("mailto:"):
+        email = email[7:]
+    email = email.strip()
+    if not EMAIL_SHAPE.match(email):
+        raise CalendarError(
+            f"«{spec}» не похоже на адрес почты. Участник указывается как "
+            "адрес@почта или «Имя <адрес@почта>». Адрес нужен точный: "
+            "приглашение уходит письмом живому человеку, и отозвать его нельзя."
+        )
+    return name, email
+
+
+def _email_of(item) -> str:
+    value = str(item).strip()
+    if value.lower().startswith("mailto:"):
+        value = value[7:]
+    return value
+
+
+def _attendee(name: str, email: str) -> vCalAddress:
+    person = vCalAddress(f"mailto:{email}")
+    if name:
+        person.params["CN"] = vText(name)
+    person.params["ROLE"] = vText("REQ-PARTICIPANT")
+    person.params["PARTSTAT"] = vText("NEEDS-ACTION")
+    person.params["RSVP"] = vText("TRUE")
+    return person
+
+
+def _ensure_organizer(component) -> None:
+    """Организатор обязателен: без него сервер не рассылает приглашения."""
+    if component.get("ORGANIZER") is not None:
+        return
+    address = (
+        os.environ.get("YANDEX_ORGANIZER") or os.environ.get("YANDEX_USERNAME") or ""
+    ).strip()
+    if not address:
+        raise CalendarError(
+            "Неизвестен адрес организатора встречи: не задан YANDEX_USERNAME."
+        )
+    component.add("organizer", vCalAddress(f"mailto:{address}"), encode=0)
+
+
+def _people(component) -> list[dict]:
+    raw = component.get("ATTENDEE")
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    people = []
+    for item in items:
+        params = getattr(item, "params", {})
+        status = str(params.get("PARTSTAT", "NEEDS-ACTION") or "NEEDS-ACTION").upper()
+        people.append(
+            {
+                "email": _email_of(item),
+                "name": str(params.get("CN", "") or ""),
+                "status": PARTSTAT_LABELS.get(status, status.lower()),
+            }
+        )
+    return people
+
+
+def _apply_attendees(component, add, remove) -> None:
+    """Добавляет и убирает участников, сохраняя ответы остальных.
+
+    Список не перезаписывается целиком намеренно: перезапись стёрла бы уже
+    полученные ответы «принял» и «отказался» у тех, кого не трогали.
+    """
+    raw = component.get("ATTENDEE")
+    if raw is None:
+        items = []
+    else:
+        items = list(raw) if isinstance(raw, list) else [raw]
+
+    if remove:
+        drop = {_parse_person(spec)[1].casefold() for spec in remove}
+        kept = [item for item in items if _email_of(item).casefold() not in drop]
+        if len(kept) == len(items):
+            raise CalendarError(
+                "Ни одного из названных участников в событии нет — ничего не убрано. "
+                "Сверьте адреса с выдачей list_events."
+            )
+        items = kept
+
+    if add:
+        present = {_email_of(item).casefold() for item in items}
+        for spec in add:
+            name, email = _parse_person(spec)
+            if email.casefold() in present:
+                continue
+            items.append(_attendee(name, email))
+            present.add(email.casefold())
+
+    component.pop("ATTENDEE", None)
+    for item in items:
+        component.add("attendee", item, encode=0)
+    if items:
+        _ensure_organizer(component)
 
 
 REPEAT_RULES = {
@@ -572,6 +696,7 @@ def create_event(
     repeat: str | None = None,
     repeat_count: int | None = None,
     repeat_until: str | None = None,
+    attendees: list | None = None,
 ) -> dict:
     tz = local_tz()
     if not calendar or not calendar.strip():
@@ -638,6 +763,9 @@ def create_event(
     if rule is not None:
         event.add("rrule", rule)
 
+    if attendees:
+        _apply_attendees(event, attendees, None)
+
     ical.add_component(event)
 
     try:
@@ -662,13 +790,24 @@ def update_event(
     duration_minutes: int | None = None,
     location: str | None = None,
     description: str | None = None,
+    attendees_add: list | None = None,
+    attendees_remove: list | None = None,
     occurrence: str | None = None,
     apply_to_series: bool = False,
 ) -> dict:
     tz = local_tz()
     if all(
-        value is None
-        for value in (summary, start, end, duration_minutes, location, description)
+        not value if isinstance(value, list) else value is None
+        for value in (
+            summary,
+            start,
+            end,
+            duration_minutes,
+            location,
+            description,
+            attendees_add,
+            attendees_remove,
+        )
     ):
         raise CalendarError("Не указано ни одного изменения.")
 
@@ -719,6 +858,9 @@ def update_event(
         component.pop("DESCRIPTION", None)
         if description.strip():
             component.add("description", description.strip())
+
+    if attendees_add or attendees_remove:
+        _apply_attendees(component, attendees_add, attendees_remove)
 
     if start is not None or end is not None or duration_minutes is not None:
         if before["all_day"]:

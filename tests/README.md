@@ -39,6 +39,20 @@ Then a weekly series of three occurrences:
 Шаги 7 и 8 — главные: они доказывают, что правка и удаление одного дня серии
 не задевают остальные дни.
 
+## Круг с участниками — только по явному адресу
+
+```
+python tests/write_cycle.py "Calendar name" someone@example.com
+```
+
+Без второго довода этот круг пропускается, и это намеренно: он **рассылает
+настоящие письма** — приглашение при добавлении участника и отмену при
+удалении. Отозвать их нельзя. Запускайте только на адрес, который вам
+разрешили беспокоить.
+
+Without a second argument this round is skipped on purpose: it sends real
+invitation and cancellation email, which cannot be recalled.
+
 The cycle cleans up after itself. If the final delete fails, the leftover
 event's `uid` is printed — leaving rubbish in someone's real calendar without
 saying so is not acceptable.

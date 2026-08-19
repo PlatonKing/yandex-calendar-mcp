@@ -95,8 +95,8 @@ TOOLS = [
         "name": "create_event",
         "description": (
             "Создать событие в Яндекс Календаре: разовое, на весь день или "
-            "повторяющееся. Время указывается в настроенном поясе, метка "
-            "часового пояса проставляется сама. "
+            "повторяющееся, при необходимости с участниками. Время указывается "
+            "в настроенном поясе, метка часового пояса проставляется сама. "
             "Календарь обязателен: их несколько и они под разные задачи — "
             "если пользователь не назвал календарь, спросите, а не выбирайте сами."
         ),
@@ -155,6 +155,17 @@ TOOLS = [
                         "Нельзя вместе с repeat_count."
                     ),
                 },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Участники встречи: «Имя <адрес@почта>» или просто адрес. "
+                        "Каждому уходит приглашение письмом, отозвать его нельзя, "
+                        "поэтому адреса должны быть точными и подтверждёнными "
+                        "пользователем. Не угадывайте и не восстанавливайте адрес "
+                        "по имени."
+                    ),
+                },
             },
             "required": ["calendar", "summary", "start"],
         },
@@ -163,7 +174,8 @@ TOOLS = [
         "name": "update_event",
         "description": (
             "Изменить существующее событие: перенести время, переименовать, "
-            "сменить место или описание. Событие ищется по метке id из list_events. "
+            "сменить место или описание, добавить или убрать участников. "
+            "Событие ищется по метке id из list_events. "
             "Передавайте только то, что меняется; остальное останется как было. "
             "У повторяющегося события можно изменить либо один день — параметр "
             "occurrence, — либо всю серию целиком (apply_to_series). "
@@ -198,6 +210,24 @@ TOOLS = [
                 },
                 "location": {"type": "string", "description": "Новое место."},
                 "description": {"type": "string", "description": "Новое описание."},
+                "attendees_add": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Кого добавить во встречу: «Имя <адрес@почта>» или просто "
+                        "адрес. Каждому уходит приглашение письмом, отозвать его "
+                        "нельзя — адреса должны быть точными и подтверждёнными "
+                        "пользователем. Уже добавленные повторно не приглашаются."
+                    ),
+                },
+                "attendees_remove": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Кого убрать из встречи, по адресу почты. Ответы остальных "
+                        "участников при этом сохраняются."
+                    ),
+                },
                 "occurrence": {
                     "type": "string",
                     "description": (
@@ -319,6 +349,11 @@ def format_events(data: dict) -> str:
             parts.append(f"календарь: {ev['calendar']}")
             if ev["repeating"]:
                 parts.append("повторяющееся")
+            people = ev.get("attendees") or []
+            if people:
+                parts.append(
+                    "участники: " + ", ".join(_person_label(p) for p in people)
+                )
             if not ev["expanded"]:
                 parts.append(
                     "ВНИМАНИЕ: правило повтора не развёрнуто, дата может быть неточной"
@@ -340,9 +375,19 @@ def format_one(ev: dict) -> str:
         parts.append(f"место: {ev['location']}")
     if ev["repeating"]:
         parts.append("повторяющееся")
+    people = ev.get("attendees") or []
+    if people:
+        parts.append("участники: " + ", ".join(_person_label(p) for p in people))
     if ev["uid"]:
         parts.append(f"id: {ev['uid']}")
     return " | ".join(parts)
+
+
+def _person_label(person: dict) -> str:
+    who = person["name"] or person["email"]
+    if person["name"]:
+        who = f"{person['name']} <{person['email']}>"
+    return f"{who} — {person['status']}"
 
 
 def format_created(data: dict) -> str:
@@ -416,6 +461,7 @@ def call_tool(name: str, arguments: dict) -> dict:
                     repeat=arguments.get("repeat"),
                     repeat_count=arguments.get("repeat_count"),
                     repeat_until=arguments.get("repeat_until"),
+                    attendees=arguments.get("attendees"),
                 )
             )
         elif name == "update_event":
@@ -429,6 +475,8 @@ def call_tool(name: str, arguments: dict) -> dict:
                     duration_minutes=arguments.get("duration_minutes"),
                     location=arguments.get("location"),
                     description=arguments.get("description"),
+                    attendees_add=arguments.get("attendees_add"),
+                    attendees_remove=arguments.get("attendees_remove"),
                     occurrence=arguments.get("occurrence"),
                     apply_to_series=bool(arguments.get("apply_to_series")),
                 )

@@ -19,6 +19,8 @@ CalDAV. Read the schedule, create, move and delete events.
   from — or a single calendar selected by name.
 - Recurring events expanded into concrete dates. If expansion fails, the event
   is returned with a warning rather than presented as accurate.
+- Attendees listed with how each of them replied — accepted, declined,
+  tentative or no answer yet.
 - All-day events recognised as such, not shown as midnight appointments.
 - Every answer states the time zone and UTC offset it used.
 
@@ -35,6 +37,8 @@ CalDAV. Read the schedule, create, move and delete events.
   series. A changed day becomes a `RECURRENCE-ID` override, a removed day an
   `EXDATE` — the standard mechanisms, so the result looks right in the Yandex
   app and in any other client.
+- Invite people: attendees can be added when creating an event, and added or
+  removed later. Yandex mails the invitations and cancellations itself.
 - Delete an event, with the safeguards described below.
 
 **Time zones, handled deliberately**
@@ -81,6 +85,7 @@ All settings come from environment variables.
 | `YANDEX_CALDAV_URL` | no | `https://caldav.yandex.ru` | CalDAV endpoint |
 | `YANDEX_TIMEZONE` | no | `Europe/Moscow` | IANA zone for all input and output |
 | `YANDEX_TRASH_DIR` | no | `<project>/trash` | where copies of changed and deleted events are kept |
+| `YANDEX_ORGANIZER` | no | value of `YANDEX_USERNAME` | address that appears as the meeting organizer in invitations |
 
 The server speaks MCP over stdio. Example client configuration is in
 [`examples/`](examples/).
@@ -91,8 +96,8 @@ The server speaks MCP over stdio. Example client configuration is in
 |---|---|
 | `list_events` | events for a period; defaults to today; expands recurrences |
 | `list_calendars` | calendar names and URLs |
-| `create_event` | create an event, one-off or recurring; `calendar` is required |
-| `update_event` | move, rename, change location or description; one day of a series or the whole series |
+| `create_event` | create an event, one-off or recurring, with attendees; `calendar` is required |
+| `update_event` | move, rename, change location or description, add or remove attendees; one day of a series or the whole series |
 | `delete_event` | delete an event; one day of a series or the whole series |
 
 ## Deleting is irreversible — what protects you
@@ -110,17 +115,42 @@ The server speaks MCP over stdio. Example client configuration is in
    series. With neither, the tool refuses and explains the choice. This is
    what keeps "cancel Tuesday" from erasing a year of meetings.
 
+## Inviting people sends real email
+
+Yandex advertises `calendar-auto-schedule`, so adding an attendee makes the
+server send an invitation, and removing one sends a cancellation. Neither can
+be recalled. What follows from that:
+
+- Addresses are taken literally and validated. The server never derives an
+  address from a name — an assistant that half-remembers a contact would
+  otherwise email a stranger.
+- `update_event` **adds and removes** attendees instead of replacing the list,
+  so answers already given by the others are preserved.
+- Every response lists exactly who is on the event and how they replied, so a
+  wrong address is visible immediately.
+
+An assistant driving this server should confirm the address list with its user
+before calling. Sending an invitation is not an undoable action.
+
 ## Testing
 
 ```
 python tests/write_cycle.py "Calendar name"
 ```
 
-Runs a full self-cleaning round against a real calendar through the actual
-protocol: create → attempt to delete with a wrong title (must be refused) →
-move and rename → confirm it appears in the listing → delete → confirm it is
-gone. If the final delete fails, the leftover event's `uid` is printed instead
-of being silently left behind.
+Self-cleaning rounds against a real calendar through the actual protocol. A
+one-off event: create → attempt to delete with a wrong title (must be refused)
+→ move and rename → confirm it appears in the listing → delete → confirm it is
+gone. A three-occurrence series: edit one day, delete one day, delete the whole
+series, checking each time that exactly one day changed. If a delete fails, the
+leftover event's `uid` is printed instead of being silently left behind.
+
+The attendee round only runs when an address is passed explicitly, because it
+sends real email:
+
+```
+python tests/write_cycle.py "Calendar name" someone@example.com
+```
 
 `tests/probe.jsonl` is a set of raw protocol messages for checking the
 handshake and read path:
@@ -136,7 +166,9 @@ python src/server.py < tests/probe.jsonl
   month / year, with a count or an end date). More elaborate rules — "every
   second Tuesday", weekday sets — are read and expanded correctly but cannot
   be created through the tool.
-- Attendees, reminders and invitations are not handled.
+- Reminders and alarms are not handled.
+- Attendees are always invited as required participants; optional attendees
+  and per-attendee roles are not exposed.
 - Verified against Yandex Calendar only. Other CalDAV servers are likely to
   work but are untested.
 

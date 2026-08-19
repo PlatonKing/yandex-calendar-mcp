@@ -25,6 +25,7 @@ TITLE = "ТЕСТ yandex-calendar-mcp — можно удалять"
 TITLE_NEW = "ТЕСТ yandex-calendar-mcp — переименовано"
 SERIES = "ТЕСТ yandex-calendar-mcp — серия"
 SERIES_DAY = "ТЕСТ yandex-calendar-mcp — правленый день серии"
+GUESTS = "ТЕСТ yandex-calendar-mcp — с участником"
 
 
 class Server:
@@ -202,8 +203,55 @@ def series_cycle(server, calendar, steps):
     return None
 
 
+def attendee_cycle(server, calendar, address, steps):
+    """Участники. Запускается только с явно переданным адресом.
+
+    На этот адрес уйдут настоящие письма: приглашение при добавлении и
+    отмена при удалении. Поэтому по умолчанию круг не запускается.
+    """
+    day = (date.today() + timedelta(days=2)).isoformat()
+
+    failed, text = server.call(
+        "create_event",
+        {
+            "calendar": calendar,
+            "summary": GUESTS,
+            "start": f"{day} 10:00",
+            "duration_minutes": 30,
+            "attendees": [f"Проверка связи <{address}>"],
+        },
+    )
+    steps.append(("участники: создание со встречей", failed, text))
+    if failed:
+        return None
+    uid = uid_from(text)
+
+    failed, text = server.call(
+        "list_events", {"date_from": day, "date_to": day, "calendar": calendar}
+    )
+    steps.append(("участники: видны в выдаче", failed or address not in text, text))
+
+    failed, text = server.call(
+        "update_event",
+        {"uid": uid, "calendar": calendar, "attendees_remove": [address]},
+    )
+    steps.append(("участники: удаление участника", failed, text))
+
+    failed, text = server.call(
+        "list_events", {"date_from": day, "date_to": day, "calendar": calendar}
+    )
+    steps.append(("участники: после удаления не видны", failed or address in text, text))
+
+    failed, text = server.call(
+        "delete_event", {"uid": uid, "summary": GUESTS, "calendar": calendar}
+    )
+    steps.append(("участники: уборка события", failed, text))
+    return None if not failed else uid
+
+
 def main():
     calendar = sys.argv[1] if len(sys.argv) > 1 else "Личное"
+    address = sys.argv[2] if len(sys.argv) > 2 else None
     server = Server()
     server.ask(
         "initialize",
@@ -219,6 +267,11 @@ def main():
         single_cycle(server, calendar, steps),
         series_cycle(server, calendar, steps),
     ]
+    if address:
+        leftovers.append(attendee_cycle(server, calendar, address, steps))
+    else:
+        print("Круг с участниками пропущен: адрес не передан вторым доводом.")
+        print("Он рассылает настоящие письма, поэтому сам по себе не запускается.")
     server.close()
 
     report(steps, [uid for uid in leftovers if uid])
