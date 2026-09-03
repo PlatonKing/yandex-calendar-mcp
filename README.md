@@ -201,6 +201,10 @@ python src/server.py < tests/probe.jsonl
   second Tuesday", weekday sets — are read and expanded correctly but cannot
   be created through the tool.
 - Reminders and alarms are not handled.
+- **A reply to a meeting whose organizer is outside Yandex** (an event that
+  originated in Google, say) is accepted by the server and not applied.
+  Verified on a live event. The tool reports the failure; the reply has to be
+  given in the Yandex app.
 - Replies are verified but their delivery to the organizer is not: the server
   reports no error either way.
 - Attendees are always invited as required participants; optional attendees
