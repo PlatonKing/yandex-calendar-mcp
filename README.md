@@ -1,7 +1,8 @@
 # yandex-calendar-mcp
 
 An MCP server that gives an AI assistant access to **Yandex Calendar** over
-CalDAV. Read the schedule, create, move and delete events.
+CalDAV. Read the schedule, create, move and delete events, invite people and
+reply to invitations.
 
 [Русская версия](README.ru.md)
 
@@ -39,7 +40,15 @@ CalDAV. Read the schedule, create, move and delete events.
   app and in any other client.
 - Invite people: attendees can be added when creating an event, and added or
   removed later. Yandex mails the invitations and cancellations itself.
+- Reply to someone else's invitation — accept, tentative or decline — for a
+  single occurrence or the whole series.
 - Delete an event, with the safeguards described below.
+
+**Every write is checked afterwards.** After each change the event is read back
+from the server and compared against what was asked for. If the server accepted
+the request and did not apply it — which happens, see below — the tool reports
+failure instead of success. A calendar tool that lies about having deleted
+something is worse than one that cannot delete at all.
 
 **Time zones, handled deliberately**
 
@@ -98,7 +107,8 @@ The server speaks MCP over stdio. Example client configuration is in
 | `list_calendars` | calendar names and URLs |
 | `create_event` | create an event, one-off or recurring, with attendees; `calendar` is required |
 | `update_event` | move, rename, change location or description, add or remove attendees; one day of a series or the whole series |
-| `delete_event` | delete an event; one day of a series or the whole series |
+| `delete_event` | delete your own event; one day of a series or the whole series |
+| `respond_event` | reply to someone else’s invitation: accept, tentative or decline; one occurrence or the whole series |
 
 ## Deleting is irreversible — what protects you
 
@@ -114,6 +124,26 @@ The server speaks MCP over stdio. Example client configuration is in
    applies to: `occurrence` for one day, `apply_to_series` for the whole
    series. With neither, the tool refuses and explains the choice. This is
    what keeps "cancel Tuesday" from erasing a year of meetings.
+
+## Someone else's meetings: reply, don't edit
+
+An event created by another person belongs to its organizer. You are only an
+attendee, and this is not a matter of politeness — it is enforced:
+
+- **Yandex silently discards an attendee's edit.** Excluding one day of
+  another person's series, or changing its title or time, comes back `200 OK`
+  and changes nothing. Verified on live data: the exclusion list was identical
+  before and after. `update_event` and `delete_event` therefore refuse this
+  outright and explain what to do instead, rather than reporting a success that
+  did not happen.
+- **The way out is `respond_event`.** `accept`, `tentative` or `decline`, for
+  one occurrence or the whole series — the same choice the Yandex app offers.
+  The organizer is notified.
+- **A declined occurrence disappears from your calendar rather than staying
+  marked "declined".** That is how Yandex implements it: the day is dropped
+  from your copy of the series while the other days stay untouched. The tool
+  recognises this outcome as success and says so in plain words; it does not
+  demand to see a "declined" flag that the server never stores.
 
 ## Inviting people sends real email
 
@@ -171,6 +201,8 @@ python src/server.py < tests/probe.jsonl
   second Tuesday", weekday sets — are read and expanded correctly but cannot
   be created through the tool.
 - Reminders and alarms are not handled.
+- Replies are verified but their delivery to the organizer is not: the server
+  reports no error either way.
 - Attendees are always invited as required participants; optional attendees
   and per-attendee roles are not exposed.
 - Verified against Yandex Calendar only. Other CalDAV servers are likely to
