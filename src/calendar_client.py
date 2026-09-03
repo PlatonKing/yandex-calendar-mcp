@@ -1266,24 +1266,7 @@ def respond_event(
         ) from exc
 
     wanted = PARTSTAT_LABELS.get(status, status.lower())
-    fresh = _reread(uid, calendar)
-    if fresh is None:
-        raise CalendarError(
-            "После ответа событие не читается с сервера — что с ним, неизвестно. "
-            f"Копия до ответа: {backup}"
-        )
-    checked = (
-        _vevent(fresh)
-        if original_start is None
-        else (_find_override(fresh, original_start) or _vevent(fresh))
-    )
-    saved = _my_status(checked)
-    if saved != wanted:
-        raise CalendarError(
-            f"Яндекс принял ответ без ошибки, но на сервере по-прежнему стоит "
-            f"«{saved or 'ничего'}», а не «{wanted}». Ответ не сохранён. "
-            f"Копия до ответа: {backup}"
-        )
+    outcome = _confirm_response(uid, calendar, original_start, wanted, status, tz, backup)
 
     after = master if original_start is None else targets[0]
     return {
@@ -1291,7 +1274,64 @@ def respond_event(
         "calendar": cal_name,
         "scope": kind,
         "response": PARTSTAT_LABELS.get(status, status.lower()),
+        "outcome": outcome,
         "organizer": _organizer_of(master),
         "event": _describe(after, tz),
         "backup": backup,
     }
+
+
+def _occurrence_present(ical, start_value, tz) -> bool:
+    """Остался ли этот день серии в календаре после ответа."""
+    try:
+        found, _ = _instance_start(ical, start_value, tz)
+    except CalendarError:
+        return False
+    return _same_value(found, start_value)
+
+
+def _confirm_response(uid, calendar, original_start, wanted, status, tz, backup) -> str:
+    """Убеждается, что ответ действительно принят, и говорит, чем это вышло.
+
+    У Яндекса отказ от одного дня чужой серии выглядит не как сохранённая
+    отметка «отказался», а как исчезновение этого дня из календаря. Это тоже
+    успех, и проверка обязана его признавать — иначе честный инструмент
+    сообщит о неудаче там, где всё получилось.
+    """
+    fresh = _reread(uid, calendar)
+    if fresh is None:
+        if status == "DECLINED":
+            return "встреча убрана из календаря целиком"
+        raise CalendarError(
+            "После ответа событие не читается с сервера — что с ним, неизвестно. "
+            f"Копия до ответа: {backup}"
+        )
+
+    if original_start is None:
+        saved = _my_status(_vevent(fresh))
+        if saved == wanted:
+            return f"отметка участия: {wanted}"
+        raise CalendarError(
+            f"Яндекс принял ответ без ошибки, но на сервере по-прежнему стоит "
+            f"«{saved or 'ничего'}», а не «{wanted}». Ответ не сохранён. "
+            f"Копия до ответа: {backup}"
+        )
+
+    override = _find_override(fresh, original_start)
+    if override is not None and _my_status(override) == wanted:
+        return f"отметка участия на этот день: {wanted}"
+
+    if not _occurrence_present(fresh, original_start, tz):
+        if status == "DECLINED":
+            return "этот день убран из календаря, остальные дни серии на месте"
+        raise CalendarError(
+            "День пропал из календаря, хотя ответ был не отказом. "
+            f"Проверьте расписание вручную. Копия до ответа: {backup}"
+        )
+
+    saved = _my_status(override) if override is not None else _my_status(_vevent(fresh))
+    raise CalendarError(
+        f"Яндекс принял ответ без ошибки, но на сервере по-прежнему стоит "
+        f"«{saved or 'ничего'}», а не «{wanted}», и день остался в календаре. "
+        f"Ответ не сохранён. Копия до ответа: {backup}"
+    )

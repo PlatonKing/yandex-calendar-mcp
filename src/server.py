@@ -483,6 +483,7 @@ def format_response(data: dict) -> str:
     lines = [
         f"Ответ отправлен: «{data['response']}» ({data['scope']}), "
         f"календарь «{data['calendar']}».",
+        f"  проверено на сервере: {data['outcome']}",
         "  " + format_one(data["event"]),
     ]
     if data["organizer"]:
