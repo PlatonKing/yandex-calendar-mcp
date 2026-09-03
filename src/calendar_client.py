@@ -12,6 +12,7 @@ import os
 import re
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import caldav
@@ -1266,9 +1267,44 @@ def respond_event(
         ) from exc
 
     wanted = PARTSTAT_LABELS.get(status, status.lower())
-    outcome = _confirm_response(uid, calendar, original_start, wanted, status, tz, backup)
+    try:
+        outcome = _confirm_response(uid, calendar, original_start, wanted, status, tz, backup)
+    except CalendarError as direct_failure:
+        # правку своей копии Яндекс отбрасывает, когда организатор вне Яндекса.
+        # Тогда остаётся штатный путь протокола: положить готовый ответ
+        # в служебный ящик исходящих, а рассылку сервер берёт на себя.
+        try:
+            sent = _reply_via_outbox(_connect(), ical, master, status, original_start)
+        except CalendarError as outbox_failure:
+            raise CalendarError(
+                f"{direct_failure} Служебный ящик тоже не помог: {outbox_failure}"
+            ) from outbox_failure
+        try:
+            outcome = _confirm_response(
+                uid, calendar, original_start, wanted, status, tz, backup
+            )
+            outcome += f"; ответ ушёл через служебный ящик ({sent})"
+        except CalendarError:
+            outcome = (
+                f"ответ отправлен организатору через служебный ящик ({sent}), "
+                "но в вашем календаре встреча осталась — уберите её вручную "
+                "в приложении"
+            )
 
+    # показываем состояние с сервера, а не свою черновую копию: иначе
+    # в одном ответе рядом окажутся «встреча осталась» и «ваш ответ: отказался»
     after = master if original_start is None else targets[0]
+    shown = _describe(after, tz)
+    settled = _reread(uid, calendar)
+    if settled is not None:
+        on_server = (
+            _vevent(settled)
+            if original_start is None
+            else (_find_override(settled, original_start) or _vevent(settled))
+        )
+        shown["my_status"] = _my_status(on_server)
+        shown["attendees"] = _people(on_server)
+
     return {
         "timezone": str(tz),
         "calendar": cal_name,
@@ -1276,9 +1312,115 @@ def respond_event(
         "response": PARTSTAT_LABELS.get(status, status.lower()),
         "outcome": outcome,
         "organizer": _organizer_of(master),
-        "event": _describe(after, tz),
+        "event": shown,
         "backup": backup,
     }
+
+
+def _outbox_url(principal) -> str:
+    """Адрес служебного ящика исходящих ответов на приглашения.
+
+    Через него ответ уходит организатору напрямую, минуя правку своей копии
+    события. Для встреч с внешним организатором это единственный путь: свою
+    копию Яндекс в таком случае менять не даёт.
+    """
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><c:schedule-outbox-URL/></d:prop></d:propfind>"
+    )
+    try:
+        response = principal.client.request(
+            str(principal.url), "PROPFIND", body, {"Depth": "0"}
+        )
+    except Exception as exc:
+        raise CalendarError(f"Не удалось спросить адрес служебного ящика: {exc}") from exc
+
+    raw = getattr(response, "raw", "") or ""
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+    block = re.search(
+        r"schedule-outbox-url[^>]*>(.*?)</[^>]*schedule-outbox-url>", text, re.I | re.S
+    )
+    href = re.search(r"<[^>]*href>([^<]+)<", block.group(1), re.I) if block else None
+    if href is None:
+        raise CalendarError(
+            "Сервер не сообщил адрес служебного ящика исходящих ответов — "
+            "отправить ответ этим путём нельзя."
+        )
+    return urljoin(str(principal.client.url), href.group(1).strip())
+
+
+def _reply_via_outbox(principal, ical, master, status: str, recurrence_id) -> str:
+    """Отправляет организатору готовый ответ через служебный ящик.
+
+    Возвращает то, что сервер сказал о доставке.
+    """
+    organizer = _organizer_of(master)
+    if not organizer:
+        raise CalendarError("У встречи не указан организатор — ответить некому.")
+
+    mine = _my_attendee(master)
+    if mine is None:
+        raise CalendarError("Вас нет среди участников встречи.")
+    my_address = _email_of(mine)
+
+    reply = Calendar()
+    reply.add("prodid", "-//yandex-calendar-mcp//RU")
+    reply.add("version", "2.0")
+    reply.add("method", "REPLY")
+
+    # описание пояса берём из самого события: время в ответе обязано
+    # читаться так же, как в оригинале
+    for component in ical.walk("VTIMEZONE"):
+        reply.add_component(copy.deepcopy(component))
+
+    event = Event()
+    event.add("uid", str(master.get("UID", "")))
+    event.add("dtstamp", datetime.now(timezone.utc))
+    raw_start = master.get("DTSTART")
+    if raw_start is not None:
+        event.add("dtstart", raw_start.dt)
+    if recurrence_id is not None:
+        event.add("recurrence-id", recurrence_id)
+    summary = master.get("SUMMARY")
+    if summary is not None:
+        event.add("summary", str(summary))
+    try:
+        event.add("sequence", int(master.get("SEQUENCE", 0) or 0))
+    except (TypeError, ValueError):
+        event.add("sequence", 0)
+
+    event.add("organizer", vCalAddress(f"mailto:{organizer}"), encode=0)
+    answer = vCalAddress(f"mailto:{my_address}")
+    answer.params["PARTSTAT"] = vText(status)
+    event.add("attendee", answer, encode=0)
+    reply.add_component(event)
+
+    url = _outbox_url(principal)
+    try:
+        response = principal.client.request(
+            url,
+            "POST",
+            reply.to_ical(),
+            {
+                "Content-Type": "text/calendar; charset=utf-8",
+                "Originator": f"mailto:{my_address}",
+                "Recipient": f"mailto:{organizer}",
+            },
+        )
+    except Exception as exc:
+        raise CalendarError(f"Служебный ящик не принял ответ: {exc}") from exc
+
+    code = getattr(response, "status", 0)
+    raw = getattr(response, "raw", "") or ""
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+    if code not in (200, 201, 202, 204):
+        raise CalendarError(
+            f"Служебный ящик ответил кодом {code}. Ответ не отправлен. "
+            f"{text[:300]}"
+        )
+    reported = re.search(r"request-status[^>]*>([^<]+)<", text, re.I)
+    return reported.group(1).strip() if reported else f"код {code}"
 
 
 def _occurrence_present(ical, start_value, tz) -> bool:

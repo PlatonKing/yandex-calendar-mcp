@@ -201,12 +201,15 @@ python src/server.py < tests/probe.jsonl
   second Tuesday", weekday sets — are read and expanded correctly but cannot
   be created through the tool.
 - Reminders and alarms are not handled.
-- **A reply to a meeting whose organizer is outside Yandex** (an event that
-  originated in Google, say) is accepted by the server and not applied.
-  Verified on a live event. The tool reports the failure; the reply has to be
-  given in the Yandex app.
-- Replies are verified but their delivery to the organizer is not: the server
-  reports no error either way.
+- **A meeting whose organizer is outside Yandex** (one that originated in
+  Google, say) takes a reply only halfway. Yandex refuses to change your own
+  copy, so the server falls back to the scheduling outbox: the reply is handed
+  over for delivery to the organizer and the server answers `2.0;Success`. The
+  meeting still shows in your own calendar afterwards and has to be removed in
+  the Yandex app. The tool says exactly that instead of claiming a clean
+  success. Verified on a live event.
+- Delivery to the organizer is confirmed only as far as the server's own
+  acknowledgement goes; whether the mail arrived cannot be seen from here.
 - Attendees are always invited as required participants; optional attendees
   and per-attendee roles are not exposed.
 - Verified against Yandex Calendar only. Other CalDAV servers are likely to
