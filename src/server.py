@@ -258,7 +258,10 @@ TOOLS = [
             "сверяются, и при расхождении не удаляется ничего. У повторяющегося "
             "события можно удалить либо один день — параметр occurrence, — либо всю "
             "серию целиком (apply_to_series). Копия удалённого события сохраняется "
-            "в корзине."
+            "в корзине. "
+            "Для чужой встречи, куда пользователя пригласили, это не тот "
+            "инструмент: там нужен respond_event с ответом decline — тогда "
+            "организатор узнает об отказе, а встреча уйдёт из расписания."
         ),
         "inputSchema": {
             "type": "object",
@@ -294,6 +297,63 @@ TOOLS = [
                 },
             },
             "required": ["uid", "summary"],
+        },
+    },
+    {
+        "name": "respond_event",
+        "description": (
+            "Ответить на приглашение, присланное другим человеком: пойду, "
+            "возможно пойду или не пойду. Меняется только собственная отметка "
+            "участия — сама встреча остаётся чужой и не правится. Организатору "
+            "уходит уведомление об ответе. Для повторяющейся встречи ответ "
+            "даётся либо на один день (occurrence), либо на всю серию "
+            "(apply_to_series) — как в приложении Яндекса. "
+            "Отказ («не пойду») — обычный способ убрать чужую встречу из своего "
+            "расписания: удалять её через delete_event не нужно, организатор "
+            "тогда ничего не узнает."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": {
+                    "type": "string",
+                    "description": "Метка встречи — поле id из свежей выдачи list_events.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Название встречи для сверки, как в выдаче list_events.",
+                },
+                "response": {
+                    "type": "string",
+                    "enum": ["accept", "tentative", "decline"],
+                    "description": (
+                        "accept — пойду, tentative — возможно пойду, "
+                        "decline — не пойду."
+                    ),
+                },
+                "calendar": {
+                    "type": "string",
+                    "description": "Имя календаря, если известно: ускоряет поиск.",
+                },
+                "occurrence": {
+                    "type": "string",
+                    "description": (
+                        "Только для повторяющихся встреч: день, на который даётся "
+                        "ответ, ГГГГ-ММ-ДД. Если в этот день несколько повторов, "
+                        "добавьте время. Остальные дни сохраняют прежний ответ."
+                    ),
+                },
+                "apply_to_series": {
+                    "type": "boolean",
+                    "description": (
+                        "Только для повторяющихся встреч: ответ на всю серию "
+                        "сразу. Взаимоисключающе с occurrence. Для серии нужно "
+                        "указать одно из двух, иначе инструмент откажет и "
+                        "переспросит — как делает приложение Яндекса."
+                    ),
+                },
+            },
+            "required": ["uid", "summary", "response"],
         },
     },
 ]
@@ -354,6 +414,10 @@ def format_events(data: dict) -> str:
                 parts.append(
                     "участники: " + ", ".join(_person_label(p) for p in people)
                 )
+            if ev.get("organizer"):
+                parts.append(f"организатор: {ev['organizer']}")
+            if ev.get("my_status"):
+                parts.append(f"ваш ответ: {ev['my_status']}")
             if not ev["expanded"]:
                 parts.append(
                     "ВНИМАНИЕ: правило повтора не развёрнуто, дата может быть неточной"
@@ -378,6 +442,10 @@ def format_one(ev: dict) -> str:
     people = ev.get("attendees") or []
     if people:
         parts.append("участники: " + ", ".join(_person_label(p) for p in people))
+    if ev.get("organizer"):
+        parts.append(f"организатор: {ev['organizer']}")
+    if ev.get("my_status"):
+        parts.append(f"ваш ответ: {ev['my_status']}")
     if ev["uid"]:
         parts.append(f"id: {ev['uid']}")
     return " | ".join(parts)
@@ -409,6 +477,18 @@ def format_updated(data: dict) -> str:
             f"  копия до правки: {data['backup']}",
         ]
     )
+
+
+def format_response(data: dict) -> str:
+    lines = [
+        f"Ответ отправлен: «{data['response']}» ({data['scope']}), "
+        f"календарь «{data['calendar']}».",
+        "  " + format_one(data["event"]),
+    ]
+    if data["organizer"]:
+        lines.append(f"  организатор уведомлён: {data['organizer']}")
+    lines.append(f"  копия до ответа: {data['backup']}")
+    return "\n".join(lines)
 
 
 def format_deleted(data: dict) -> str:
@@ -477,6 +557,17 @@ def call_tool(name: str, arguments: dict) -> dict:
                     description=arguments.get("description"),
                     attendees_add=arguments.get("attendees_add"),
                     attendees_remove=arguments.get("attendees_remove"),
+                    occurrence=arguments.get("occurrence"),
+                    apply_to_series=bool(arguments.get("apply_to_series")),
+                )
+            )
+        elif name == "respond_event":
+            text = format_response(
+                cc.respond_event(
+                    uid=arguments.get("uid") or "",
+                    summary=arguments.get("summary") or "",
+                    response=arguments.get("response") or "",
+                    calendar=arguments.get("calendar"),
                     occurrence=arguments.get("occurrence"),
                     apply_to_series=bool(arguments.get("apply_to_series")),
                 )

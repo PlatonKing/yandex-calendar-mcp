@@ -35,6 +35,13 @@ DEFAULT_DURATION_MINUTES = 60
 
 EMAIL_SHAPE = re.compile(r"^[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+$")
 
+# что можно ответить на чужое приглашение
+RESPONSES = {
+    "accept": "ACCEPTED",
+    "tentative": "TENTATIVE",
+    "decline": "DECLINED",
+}
+
 # как называются ответы участников на приглашение
 PARTSTAT_LABELS = {
     "NEEDS-ACTION": "не ответил",
@@ -252,6 +259,8 @@ def list_events(
                         "repeating": repeating,
                         "expanded": expanded or not repeating,
                         "attendees": _people(component),
+                        "organizer": _organizer_of(component),
+                        "my_status": _my_status(component),
                     }
                 )
 
@@ -450,6 +459,32 @@ def _find_override(ical, start_value):
     return None
 
 
+def _override_for(ical, master, instance, original_start):
+    """Запись-заместитель для одного дня серии; создаётся, если её ещё нет.
+
+    Заместитель — отдельная запись с меткой RECURRENCE-ID: она говорит
+    «вместо повтора такого-то числа читай это». Остальные дни серии живут
+    по общему правилу и не затрагиваются.
+    """
+    existing = _find_override(ical, original_start)
+    if existing is not None:
+        return existing
+
+    fresh = copy.deepcopy(master)
+    for prop in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
+        fresh.pop(prop, None)
+    fresh.add("recurrence-id", original_start)
+    fresh.pop("DTSTART", None)
+    fresh.add("dtstart", instance.get("DTSTART").dt)
+    fresh.pop("DTEND", None)
+    fresh.pop("DURATION", None)
+    raw_end = instance.get("DTEND")
+    if raw_end is not None:
+        fresh.add("dtend", raw_end.dt)
+    ical.add_component(fresh)
+    return fresh
+
+
 def _exdates(component) -> list:
     raw = component.get("EXDATE")
     if raw is None:
@@ -496,13 +531,20 @@ def _find_event(uid: str, calendar: str | None = None):
     )
 
 
-def _touch(component) -> None:
-    """Отмечает правку: часы изменения и порядковый номер версии."""
+def _touch(component, bump_sequence: bool = True) -> None:
+    """Отмечает правку: часы изменения и, если нужно, номер версии.
+
+    Номер версии принадлежит организатору встречи. Когда мы всего лишь
+    отвечаем на чужое приглашение, поднимать его нельзя: для организатора
+    это выглядело бы так, будто встречу переписали.
+    """
     now = datetime.now(timezone.utc)
     component.pop("DTSTAMP", None)
     component.add("dtstamp", now)
     component.pop("LAST-MODIFIED", None)
     component.add("last-modified", now)
+    if not bump_sequence:
+        return
     try:
         sequence = int(component.get("SEQUENCE", 0))
     except (TypeError, ValueError):
@@ -523,6 +565,8 @@ def _describe(component, tz: ZoneInfo) -> dict:
         "repeating": component.get("RRULE") is not None,
         "expanded": True,
         "attendees": _people(component),
+        "organizer": _organizer_of(component),
+        "my_status": _my_status(component),
     }
 
 
@@ -597,6 +641,102 @@ def _people(component) -> list[dict]:
             }
         )
     return people
+
+
+def _my_addresses() -> set[str]:
+    """Адреса, под которыми владелец календаря значится участником."""
+    found = set()
+    for name in ("YANDEX_SELF", "YANDEX_USERNAME", "YANDEX_ORGANIZER"):
+        value = (os.environ.get(name) or "").strip().casefold()
+        if value:
+            found.add(value)
+    return found
+
+
+def _my_attendee(component):
+    """Находит строку участника, которая относится к самому владельцу."""
+    mine = _my_addresses()
+    raw = component.get("ATTENDEE")
+    if raw is None:
+        return None
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if _email_of(item).casefold() in mine:
+            return item
+    return None
+
+
+def _reread(uid: str, calendar: str | None):
+    """Перечитывает событие с сервера. None — если его там больше нет."""
+    try:
+        obj, _ = _find_event(uid, calendar)
+        return obj.icalendar_instance
+    except Exception:
+        return None
+
+
+def _ensure_mine(component, action: str) -> None:
+    """Запрещает править правило чужой серии.
+
+    Проверено на живых данных: Яндекс принимает такой запрос без ошибки
+    и молча его отбрасывает — правило встречи принадлежит организатору.
+    Раньше это выглядело как успешное удаление, которого не было.
+    """
+    organizer = _organizer_of(component)
+    if not organizer or organizer.casefold() in _my_addresses():
+        return
+    raise CalendarError(
+        f"Эту встречу создал другой человек ({organizer}), и {action} Яндекс "
+        "не сохранит: правило серии принадлежит организатору. Чтобы убрать "
+        "встречу из своего расписания, ответьте отказом — respond_event "
+        "с response=decline. Организатор получит уведомление, а встреча уйдёт "
+        "из вашего календаря. Ничего не сделано."
+    )
+
+
+def _my_status(component) -> str:
+    """Ответ самого владельца на это приглашение, если он там участник."""
+    item = _my_attendee(component)
+    if item is None:
+        return ""
+    params = getattr(item, "params", {})
+    status = str(params.get("PARTSTAT", "NEEDS-ACTION") or "NEEDS-ACTION").upper()
+    return PARTSTAT_LABELS.get(status, status.lower())
+
+
+def _organizer_of(component) -> str:
+    raw = component.get("ORGANIZER")
+    if raw is None:
+        return ""
+    return _email_of(raw)
+
+
+def _set_partstat(component, status: str) -> bool:
+    """Ставит ответ владельца в этой записи. Возвращает, нашлась ли строка."""
+    raw = component.get("ATTENDEE")
+    if raw is None:
+        return False
+    items = raw if isinstance(raw, list) else [raw]
+    mine = _my_addresses()
+    touched = False
+    rebuilt = []
+    for item in items:
+        if _email_of(item).casefold() in mine:
+            fresh = vCalAddress(str(item))
+            for key, value in getattr(item, "params", {}).items():
+                fresh.params[key] = value
+            fresh.params["PARTSTAT"] = vText(status)
+            fresh.params.pop("RSVP", None)
+            rebuilt.append(fresh)
+            touched = True
+        else:
+            rebuilt.append(item)
+    if not touched:
+        return False
+    component.pop("ATTENDEE", None)
+    for item in rebuilt:
+        component.add("attendee", item, encode=0)
+    return True
 
 
 def _apply_attendees(component, add, remove) -> None:
@@ -826,20 +966,8 @@ def update_event(
         original_start, instance = _instance_start(ical, scope, tz)
         before = _describe(instance, tz)
         kind = "один день серии"
-        component = _find_override(ical, original_start)
-        if component is None:
-            component = copy.deepcopy(master)
-            for prop in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
-                component.pop(prop, None)
-            component.add("recurrence-id", original_start)
-            component.pop("DTSTART", None)
-            component.add("dtstart", instance.get("DTSTART").dt)
-            component.pop("DTEND", None)
-            component.pop("DURATION", None)
-            raw_end = instance.get("DTEND")
-            if raw_end is not None:
-                component.add("dtend", raw_end.dt)
-            ical.add_component(component)
+        _ensure_mine(master, "правку одного дня серии")
+        component = _override_for(ical, master, instance, original_start)
 
     backup = _snapshot(str(master.get("UID", "") or uid), "изменение", obj.data)
 
@@ -901,14 +1029,58 @@ def update_event(
             f"Яндекс не принял изменение: {exc}. Копия события до правки: {backup}"
         ) from exc
 
+    after = _describe(component, tz)
+    _confirm_saved(uid, calendar, original_start, after, tz, backup)
+
     return {
         "timezone": str(tz),
         "calendar": cal_name,
         "scope": kind,
         "before": before,
-        "after": _describe(component, tz),
+        "after": after,
         "backup": backup,
     }
+
+
+def _confirm_saved(uid, calendar, original_start, expected: dict, tz, backup: str) -> None:
+    """Перечитывает событие и убеждается, что правка действительно легла.
+
+    Сервер может принять запрос без ошибки и не применить его — так уже было
+    с чужими встречами. Рапортовать успех, не проверив, нельзя.
+    """
+    fresh = _reread(uid, calendar)
+    if fresh is None:
+        raise CalendarError(
+            "После правки событие не читается с сервера — что с ним, неизвестно. "
+            f"Копия до правки: {backup}"
+        )
+    if original_start is None:
+        checked = _vevent(fresh)
+    else:
+        checked = _find_override(fresh, original_start) or _vevent(fresh)
+    saved = _describe(checked, tz)
+
+    people_expected = sorted(p["email"].casefold() for p in expected["attendees"])
+    people_saved = sorted(p["email"].casefold() for p in saved["attendees"])
+    mismatch = [
+        name
+        for name, one, two in (
+            ("название", expected["summary"], saved["summary"]),
+            ("время", str(expected["start"]), str(saved["start"])),
+            ("место", expected["location"], saved["location"]),
+            ("участники", people_expected, people_saved),
+        )
+        if one != two
+    ]
+    if not mismatch:
+        return
+    raise CalendarError(
+        "Яндекс принял правку без ошибки, но на сервере она не сохранилась: "
+        + ", ".join(mismatch)
+        + ". Обычная причина — событие чужое: менять его может только "
+        "организатор, а участник может лишь ответить через respond_event. "
+        f"Копия до правки: {backup}"
+    )
 
 
 def delete_event(
@@ -956,6 +1128,9 @@ def delete_event(
             "Ничего не удалено."
         )
 
+    if original_start is not None:
+        _ensure_mine(master, "удаление одного дня серии")
+
     backup = _snapshot(str(master.get("UID", "") or uid), "удаление", obj.data)
 
     try:
@@ -976,10 +1151,147 @@ def delete_event(
             f"Яндекс не дал удалить событие: {exc}. Копия события: {backup}"
         ) from exc
 
+    # проверка после записи: сервер мог принять запрос и не применить его
+    fresh = _reread(uid, calendar)
+    if original_start is None:
+        if fresh is not None:
+            raise CalendarError(
+                "Яндекс принял запрос без ошибки, но событие осталось в календаре. "
+                "Скорее всего, оно чужое: удалять чужие события участнику нельзя, "
+                "нужен отказ через respond_event с response=decline. "
+                f"Ничего не удалено. Копия события: {backup}"
+            )
+    elif fresh is not None:
+        if not any(_same_value(v, original_start) for v in _exdates(_vevent(fresh))):
+            raise CalendarError(
+                "Яндекс принял запрос без ошибки, но день серии остался на месте — "
+                "изменение не сохранилось. Ничего не удалено. "
+                f"Копия события: {backup}"
+            )
+
     return {
         "timezone": str(tz),
         "calendar": cal_name,
         "scope": kind,
         "event": found,
+        "backup": backup,
+    }
+
+
+def respond_event(
+    uid: str,
+    summary: str,
+    response: str,
+    calendar: str | None = None,
+    occurrence: str | None = None,
+    apply_to_series: bool = False,
+) -> dict:
+    """Ответ на чужое приглашение: пойду, возможно пойду, не пойду.
+
+    Меняется только собственная строка участника — сама встреча остаётся
+    чужой, и трогать её нельзя. Организатору уходит уведомление об ответе.
+
+    Для повторяющейся встречи ответ можно дать на один день или на всю серию,
+    ровно как в приложении Яндекса.
+    """
+    tz = local_tz()
+    status = RESPONSES.get((response or "").strip().lower())
+    if status is None:
+        raise CalendarError(
+            f"Ответ {response!r} не понят. Бывает accept — пойду, "
+            "tentative — возможно пойду, decline — не пойду."
+        )
+    if not summary or not summary.strip():
+        raise CalendarError(
+            "Не указано название встречи. Оно нужно для сверки: возьмите его "
+            "из выдачи list_events ровно как там написано."
+        )
+
+    obj, cal_name = _find_event(uid, calendar)
+    ical = obj.icalendar_instance
+    master = _vevent(ical)
+    scope = _resolve_scope(master, occurrence, apply_to_series, tz)
+
+    original_start = None
+    if scope is None or scope == "series":
+        found = _describe(master, tz)
+        kind = "встреча" if scope is None else "вся серия"
+    else:
+        original_start, instance = _instance_start(ical, scope, tz)
+        found = _describe(instance, tz)
+        kind = "один день серии"
+
+    if found["summary"].strip().casefold() != summary.strip().casefold():
+        raise CalendarError(
+            f"Название не совпало. Отвечали на «{summary.strip()}», "
+            f"а по этой метке лежит «{found['summary']}» в календаре «{cal_name}». "
+            "Ответ не отправлен."
+        )
+
+    if _my_attendee(master) is None:
+        people = ", ".join(person["email"] for person in _people(master)) or "никого"
+        raise CalendarError(
+            "Вас нет среди участников этой встречи, отвечать не на что. "
+            f"В участниках: {people}. Своё собственное событие удаляется "
+            "через delete_event, а не ответом на приглашение."
+        )
+
+    backup = _snapshot(str(master.get("UID", "") or uid), "ответ", obj.data)
+
+    if original_start is None:
+        # ответ на всю серию: у отдельных дней мог стоять свой ответ,
+        # его тоже надо привести к общему, иначе останутся расхождения
+        targets = list(ical.walk("VEVENT"))
+    else:
+        targets = [_override_for(ical, master, instance, original_start)]
+
+    changed = False
+    for component in targets:
+        if _set_partstat(component, status):
+            _touch(component, bump_sequence=False)
+            changed = True
+
+    if not changed:
+        raise CalendarError(
+            "Не нашлась ваша строка участника — ничего не изменено. "
+            f"Копия события: {backup}"
+        )
+
+    try:
+        obj.data = ical.to_ical().decode("utf-8")
+        obj.save()
+    except Exception as exc:
+        raise CalendarError(
+            f"Яндекс не принял ответ: {exc}. Копия события: {backup}"
+        ) from exc
+
+    wanted = PARTSTAT_LABELS.get(status, status.lower())
+    fresh = _reread(uid, calendar)
+    if fresh is None:
+        raise CalendarError(
+            "После ответа событие не читается с сервера — что с ним, неизвестно. "
+            f"Копия до ответа: {backup}"
+        )
+    checked = (
+        _vevent(fresh)
+        if original_start is None
+        else (_find_override(fresh, original_start) or _vevent(fresh))
+    )
+    saved = _my_status(checked)
+    if saved != wanted:
+        raise CalendarError(
+            f"Яндекс принял ответ без ошибки, но на сервере по-прежнему стоит "
+            f"«{saved or 'ничего'}», а не «{wanted}». Ответ не сохранён. "
+            f"Копия до ответа: {backup}"
+        )
+
+    after = master if original_start is None else targets[0]
+    return {
+        "timezone": str(tz),
+        "calendar": cal_name,
+        "scope": kind,
+        "response": PARTSTAT_LABELS.get(status, status.lower()),
+        "organizer": _organizer_of(master),
+        "event": _describe(after, tz),
         "backup": backup,
     }
